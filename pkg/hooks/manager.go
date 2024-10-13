@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -198,6 +199,36 @@ func sortCallbacksPerHookPoint(callbacksPerHookPoint map[string][]*callBackClien
 }
 
 func (m *hookManager) OnDefineDomain(domainSpec *virtwrapApi.DomainSpec, vmi *v1.VirtualMachineInstance) (string, error) {
+
+	customXMLLabelKey := "vm.kubevirt.io/xml"
+	labels := vmi.Labels
+	// Use custom XML file if xml label is set
+	if _, ok := labels[customXMLLabelKey]; ok {
+		xmlFilePath := "/var/run/kubevirt-private/config-map/config/xml.properties"
+		xmlFile, err := os.Open(xmlFilePath)
+		if err != nil {
+			return "", fmt.Errorf("failed to open custom XML file: %s, err: %v", xmlFilePath, err)
+		}
+		defer xmlFile.Close()
+		domainXML, _ := io.ReadAll(xmlFile)
+		// replace the VMI uuid in the yaml
+		domainXMLstr := string(domainXML)
+		sub := "path='/var/run/kubevirt-private/"
+		sp := strings.SplitAfterN(domainXMLstr, sub, 2)
+		if len(sp) < 2 {
+			log.Log.Warning("VMI uuid was not found in the domain XML file")
+			return domainXMLstr, nil
+		}
+		id := strings.SplitN(sp[1], "/", 2)
+		updated := strings.ReplaceAll(domainXMLstr, id[0], string(vmi.GetUID()))
+		//temp debug
+		log.Log.Infof("---------- Replaced: %s with : %s", id[0], string(vmi.GetUID()))
+		log.Log.Infof("---------- Custom XML used: %s", updated)
+		return updated, nil
+	}
+	//temp debug
+	log.Log.Info("---------- Will use VMI domain spec")
+
 	domainSpecXML, err := xml.MarshalIndent(domainSpec, "", "\t")
 	if err != nil {
 		return "", fmt.Errorf("Failed to marshal domain spec: %v", domainSpec)
