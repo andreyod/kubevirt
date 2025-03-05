@@ -638,12 +638,20 @@ type Controller struct {
 	Type    string            `xml:"type,attr"`
 	Index   string            `xml:"index,attr"`
 	Model   string            `xml:"model,attr,omitempty"`
+	Target  *ControllerTarget `xml:"target,omitempty"`
 	Driver  *ControllerDriver `xml:"driver,omitempty"`
 	Alias   *Alias            `xml:"alias,omitempty"`
 	Address *Address          `xml:"address,omitempty"`
 }
 
 // END Controller -----------------------------
+
+// BEGIN ControllerTarget
+type ControllerTarget struct {
+	NUMANode *uint `xml:"node,omitempty"`
+}
+
+// END ControllerTarget
 
 // BEGIN ControllerDriver
 type ControllerDriver struct {

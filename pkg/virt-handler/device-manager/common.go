@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,7 @@ type DeviceHandler interface {
 	GetDeviceDriver(basepath string, pciAddress string) (string, error)
 	GetDeviceNumaNode(basepath string, pciAddress string) (numaNode int)
 	GetDevicePCIID(basepath string, pciAddress string) (string, error)
+	GetDeviceRootComplex(basepath string, pciAddress string) string
 	GetMdevParentPCIAddr(mdevUUID string) (string, error)
 	CreateMDEVType(mdevType string, parentID string) error
 	RemoveMDEVType(mdevUUID string) error
@@ -56,6 +58,23 @@ type DeviceHandler interface {
 type DeviceUtilsHandler struct{}
 
 var Handler DeviceHandler
+
+func (h *DeviceUtilsHandler) GetDeviceRootComplex(basepath string, pciAddress string) string {
+	devPath, err := os.Readlink(filepath.Join(basepath, pciAddress))
+	if err != nil {
+		log.DefaultLogger().Reason(err).Errorf("failed to read the symbolic link for device %s", pciAddress)
+		return ""
+	}
+	linkParts := strings.Split(devPath, "/")
+	// The root complex in the path looks like: pci0000:0c
+	re := regexp.MustCompile(`pci[0-9a-f]{4}:[0-9a-f]{2}`)
+	for _, dir := range linkParts {
+		if re.MatchString(dir) {
+			return dir
+		}
+	}
+	return ""
+}
 
 // getDeviceIOMMUGroup gets devices iommu_group
 // e.g. /sys/bus/pci/devices/0000\:65\:00.0/iommu_group -> ../../../../../kernel/iommu_groups/45

@@ -101,6 +101,7 @@ type ConverterContext struct {
 	SRIOVDevices                    []api.HostDevice
 	GenericHostDevices              []api.HostDevice
 	GPUHostDevices                  []api.HostDevice
+	HostDevRootControllers          []api.Controller
 	EFIConfiguration                *EFIConfiguration
 	MemBalloonStatsPeriod           uint
 	UseVirtioTransitional           bool
@@ -1780,6 +1781,9 @@ func Convert_v1_VirtualMachineInstance_To_api_Domain(vmi *v1.VirtualMachineInsta
 
 	domain.Spec.Devices.HostDevices = append(domain.Spec.Devices.HostDevices, c.GenericHostDevices...)
 	domain.Spec.Devices.HostDevices = append(domain.Spec.Devices.HostDevices, c.GPUHostDevices...)
+
+	// Add controllers for the PCI topology root buses
+	domain.Spec.Devices.Controllers = append(domain.Spec.Devices.Controllers, c.HostDevRootControllers...)
 
 	if vmi.Spec.Domain.CPU == nil || vmi.Spec.Domain.CPU.Model == "" {
 		domain.Spec.CPU.Mode = v1.CPUModeHostModel

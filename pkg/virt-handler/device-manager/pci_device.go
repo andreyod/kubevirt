@@ -46,16 +46,18 @@ const (
 )
 
 type PCIDevice struct {
-	pciID      string
-	driver     string
-	pciAddress string
-	iommuGroup string
-	numaNode   int
+	pciID       string
+	driver      string
+	pciAddress  string
+	iommuGroup  string
+	numaNode    int
+	rootComplex string
 }
 
 type PCIDevicePlugin struct {
 	*DevicePluginBase
-	iommuToPCIMap map[string]string
+	iommuToPCIMap         map[string]string
+	iommuToRootComplexMap map[string]string
 }
 
 func (dpi *PCIDevicePlugin) Start(stop <-chan struct{}) (err error) {
@@ -107,10 +109,11 @@ func (dpi *PCIDevicePlugin) Start(stop <-chan struct{}) (err error) {
 func NewPCIDevicePlugin(pciDevices []*PCIDevice, resourceName string) *PCIDevicePlugin {
 	serverSock := SocketPath(strings.Replace(resourceName, "/", "-", -1))
 	iommuToPCIMap := make(map[string]string)
+	iommuToRootComplexMap := make(map[string]string)
 
 	initHandler()
 
-	devs := constructDPIdevices(pciDevices, iommuToPCIMap)
+	devs := constructDPIdevices(pciDevices, iommuToPCIMap, iommuToRootComplexMap)
 
 	dpi := &PCIDevicePlugin{
 		DevicePluginBase: &DevicePluginBase{
@@ -125,14 +128,16 @@ func NewPCIDevicePlugin(pciDevices []*PCIDevice, resourceName string) *PCIDevice
 			done:         make(chan struct{}),
 			deregistered: make(chan struct{}),
 		},
-		iommuToPCIMap: iommuToPCIMap,
+		iommuToPCIMap:         iommuToPCIMap,
+		iommuToRootComplexMap: iommuToRootComplexMap,
 	}
 	return dpi
 }
 
-func constructDPIdevices(pciDevices []*PCIDevice, iommuToPCIMap map[string]string) (devs []*pluginapi.Device) {
+func constructDPIdevices(pciDevices []*PCIDevice, iommuToPCIMap map[string]string, iommuToRootComplexMap map[string]string) (devs []*pluginapi.Device) {
 	for _, pciDevice := range pciDevices {
 		iommuToPCIMap[pciDevice.iommuGroup] = pciDevice.pciAddress
+		iommuToRootComplexMap[pciDevice.iommuGroup] = pciDevice.rootComplex + "|" + fmt.Sprintf("%d", pciDevice.numaNode)
 		dpiDev := &pluginapi.Device{
 			ID:     pciDevice.iommuGroup,
 			Health: pluginapi.Healthy,
@@ -153,6 +158,7 @@ func constructDPIdevices(pciDevices []*PCIDevice, iommuToPCIMap map[string]strin
 func (dpi *PCIDevicePlugin) Allocate(_ context.Context, r *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	resourceNameEnvVar := util.ResourceNameToEnvVar(v1.PCIResourcePrefix, dpi.resourceName)
 	allocatedDevices := []string{}
+	allocatedDevicesAffinity := []string{}
 	resp := new(pluginapi.AllocateResponse)
 	containerResponse := new(pluginapi.ContainerAllocateResponse)
 
@@ -166,10 +172,23 @@ func (dpi *PCIDevicePlugin) Allocate(_ context.Context, r *pluginapi.AllocateReq
 			}
 			allocatedDevices = append(allocatedDevices, devPCIAddress)
 			deviceSpecs = append(deviceSpecs, formatVFIODeviceSpecs(devID)...)
+			devRootComplex, exist := dpi.iommuToRootComplexMap[devID]
+			if !exist {
+				continue
+			}
+			allocatedDevicesAffinity = append(allocatedDevicesAffinity, devRootComplex+"|"+devPCIAddress)
+
 		}
 		containerResponse.Devices = deviceSpecs
 		envVar := make(map[string]string)
 		envVar[resourceNameEnvVar] = strings.Join(allocatedDevices, ",")
+		// TODO util const or func for "_ROOT_COMPLEX"
+		resourceAffinityEnvVar := resourceNameEnvVar + "_ROOT_COMPLEX"
+		envVar[resourceAffinityEnvVar] = strings.Join(allocatedDevicesAffinity, ",")
+
+		//TEMP testing
+		// envVar[resourceAffinityEnvVar] = "pci0000:00|-1,pci0000:00|0,pci0000:01|-1,pci0000:02|0,pci0000:02|0,pci0000:03|1,pci0000:04|0,"
+		// envVar[resourceAffinityEnvVar] = "pci0000:02|0|0000:00:04.0"
 
 		containerResponse.Envs = envVar
 		resp.ContainerResponses = append(resp.ContainerResponses, containerResponse)
@@ -286,6 +305,7 @@ func discoverPermittedHostPCIDevices(supportedPCIDeviceMap map[string]string) ma
 			pcidev.iommuGroup = iommuGroup
 			pcidev.driver = driver
 			pcidev.numaNode = Handler.GetDeviceNumaNode(pciBasePath, info.Name())
+			pcidev.rootComplex = Handler.GetDeviceRootComplex(pciBasePath, info.Name())
 			pciDevicesMap[resourceName] = append(pciDevicesMap[resourceName], pcidev)
 		}
 		return nil

@@ -71,6 +71,16 @@ func (_mr *_MockDeviceHandlerRecorder) GetDevicePCIID(arg0, arg1 interface{}) *g
 	return _mr.mock.ctrl.RecordCall(_mr.mock, "GetDevicePCIID", arg0, arg1)
 }
 
+func (_m *MockDeviceHandler) GetDeviceRootComplex(basepath string, pciAddress string) string {
+	ret := _m.ctrl.Call(_m, "GetDeviceRootComplex", basepath, pciAddress)
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+func (_mr *_MockDeviceHandlerRecorder) GetDeviceRootComplex(arg0, arg1 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "GetDeviceRootComplex", arg0, arg1)
+}
+
 func (_m *MockDeviceHandler) GetMdevParentPCIAddr(mdevUUID string) (string, error) {
 	ret := _m.ctrl.Call(_m, "GetMdevParentPCIAddr", mdevUUID)
 	ret0, _ := ret[0].(string)

@@ -1087,6 +1087,18 @@ func (l *LibvirtDomainManager) generateConverterContext(vmi *v1.VirtualMachineIn
 			return nil, err
 		}
 		c.GPUHostDevices = gpuHostDevices
+
+		// create root controllers for the PCI topology
+		PCIToplogyLabelKey := "kubevirt.io/pci-topology"
+		labels := vmi.Labels
+		_, pciTopology := labels[PCIToplogyLabelKey]
+		if c.Topology != nil && pciTopology {
+			// TODO error handling
+			// TODO separate generic and gpu calls. for now path both of them to the same func
+			c.HostDevRootControllers = generic.CreateRootControllers(c.Topology, vmi.Spec.Domain.Devices.HostDevices, vmi.Spec.Domain.Devices.GPUs)
+		} else { // TODO temp else. remove it
+			logger.Info("--------- No root controlles created.")
+		}
 	}
 
 	return c, nil

@@ -21,8 +21,17 @@ package generic
 
 import (
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 
 	v1 "kubevirt.io/api/core/v1"
+
+	cmdv1 "kubevirt.io/kubevirt/pkg/handler-launcher-com/cmd/v1"
+	"kubevirt.io/kubevirt/pkg/pointer"
+	"kubevirt.io/kubevirt/pkg/util"
+
+	"kubevirt.io/client-go/log"
 
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/device/hostdevice"
@@ -94,4 +103,91 @@ func validateCreationOfAllDevices(genericHostDevices []v1.HostDevice, hostDevice
 		)
 	}
 	return nil
+}
+
+func CreateRootControllers(topology *cmdv1.Topology, hostdevs []v1.HostDevice, gpus []v1.GPU) []api.Controller {
+
+	rootControllers := []api.Controller{}
+	// maps the topology NumaCells
+	topologyNumaCells := make(map[uint]int) //TODO maybe change to a slice
+
+	numaCells := topology.GetNumaCells()
+	if len(numaCells) == 0 {
+		return rootControllers
+	}
+	for _, cell := range numaCells {
+		log.Log.Infof("----- got numa cell: %d", cell.Id)
+		topologyNumaCells[uint(cell.Id)] = 0
+	}
+
+	rootToNuma := listResources(extract(hostdevs, gpus))
+	log.Log.Infof("----- rootToNuma mapping: %v", rootToNuma)
+
+	// create PXB controller for each root bus in PCI topology
+	indexer := 1
+	for _, numaNode := range rootToNuma {
+		if _, exists := topologyNumaCells[numaNode]; !exists {
+			continue
+		}
+		newRootController := api.Controller{
+			Type:  "pci",
+			Index: strconv.Itoa(indexer),
+			Model: "pcie-expander-bus", // TODO pci vs pcie
+			Target: &api.ControllerTarget{
+				NUMANode: pointer.P(numaNode),
+			},
+		}
+		rootControllers = append(rootControllers, newRootController)
+		indexer++
+	}
+	return rootControllers
+}
+
+func listResources(resources []string) map[string]uint {
+	rootToNuma := make(map[string]uint) // maps the pci root bus to it's numa node
+	for _, resource := range resources {
+		suffix := "_ROOT_COMPLEX" // TODO make it const
+		rootEnvVarName := util.ResourceNameToEnvVar(v1.PCIResourcePrefix, resource) + suffix
+		rootComplexString, isSet := os.LookupEnv(rootEnvVarName)
+		if !isSet {
+			log.Log.Warningf("%s not set for resource %s", rootEnvVarName, resource)
+			continue
+		}
+
+		rootComplexString = strings.TrimSuffix(rootComplexString, ",")
+		log.Log.Infof("----- rootComplexString : %s", rootComplexString)
+		rootComplexes := strings.Split(rootComplexString, ",")
+		for _, complex := range rootComplexes {
+			complexData := strings.Split(complex, "|")
+			if len(complexData) != 3 {
+				continue
+			}
+			numaNode, err := strconv.ParseUint(complexData[1], 10, 32)
+			if err != nil {
+				// invalid numa node
+				continue
+			}
+			rootBus := complexData[0]
+			if !strings.HasPrefix(rootBus, "pci") || rootBus == "pci0000:00" {
+				continue
+			}
+			rootToNuma[rootBus] = uint(numaNode)
+		}
+	}
+	return rootToNuma
+}
+
+func extract(hostDevices []v1.HostDevice, gpus []v1.GPU) []string {
+	var resourceSet = make(map[string]struct{})
+	for _, hostDevice := range hostDevices {
+		resourceSet[hostDevice.DeviceName] = struct{}{}
+	}
+	for _, gpu := range gpus {
+		resourceSet[gpu.DeviceName] = struct{}{}
+	}
+	var resources []string
+	for resource := range resourceSet {
+		resources = append(resources, resource)
+	}
+	return resources
 }

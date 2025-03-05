@@ -22,6 +22,8 @@ package virtwrap
 import (
 	"encoding/xml"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 
 	"kubevirt.io/kubevirt/pkg/network/namescheme"
@@ -31,12 +33,14 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/log"
 
+	"kubevirt.io/kubevirt/pkg/util"
+
 	virtnetlink "kubevirt.io/kubevirt/pkg/network/link"
 	netvmispec "kubevirt.io/kubevirt/pkg/network/vmispec"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/cli"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter"
-	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/util"
+	wraputil "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/util"
 )
 
 type vmConfigurator interface {
@@ -222,20 +226,210 @@ func withNetworkIfacesResources(vmi *v1.VirtualMachineInstance, domainSpec *api.
 		return nil, err
 	}
 
+	// TODO not sure what to do with the condition below
+
 	if len(domainSpec.Devices.Interfaces) == len(domainSpecWithIfacesResource.Devices.Interfaces) {
 		return dom, nil
 	}
 
-	domainSpecWithoutIfacePlaceholders, err := util.GetDomainSpecWithFlags(dom, libvirt.DOMAIN_XML_INACTIVE)
+	domainSpecWithoutIfacePlaceholders, err := wraputil.GetDomainSpecWithFlags(dom, libvirt.DOMAIN_XML_INACTIVE)
 	if err != nil {
 		return nil, err
 	}
+
+	// wire up PCI topology root buses
+	domainSpecWithoutIfacePlaceholders.Devices.Controllers = connectHostDevicesToRootComplex(vmi, domainSpecWithoutIfacePlaceholders.Devices)
+
 	domainSpecWithoutIfacePlaceholders.Devices.Interfaces = domainSpec.Devices.Interfaces
 	// Only the devices are taken into account because some parameters are not assured to be returned when
 	// getting the domain spec (e.g. the `qemu:commandline` section).
 	domainSpecWithoutIfacePlaceholders.Devices.DeepCopyInto(&domainSpec.Devices)
 
 	return f(vmi, domainSpec)
+}
+
+func connectHostDevicesToRootComplex(vmi *v1.VirtualMachineInstance, devices api.Devices) []api.Controller {
+	controllers := devices.Controllers
+	log.Log.Infof("------- hostDevs %v", devices.HostDevices)
+
+	// map PXBs. if nothing - return
+	numaToRootComplexMap := make(map[uint][]string) // key - numaNode, value - array of PXB indexes
+	for _, controller := range controllers {
+		if controller.Model == "pcie-expander-bus" {
+			if controller.Target == nil || controller.Target.NUMANode == nil {
+				continue
+			}
+			numaNode := *controller.Target.NUMANode
+			numaToRootComplexMap[numaNode] = append(numaToRootComplexMap[numaNode], controller.Index)
+		}
+	}
+	if len(numaToRootComplexMap) == 0 { // No root complexes to connect
+		log.Log.Info("------ No root complexes to connect. Done")
+		return controllers
+	}
+
+	// get env var. map
+	numaToDevices := listResources(extract(vmi.Spec.Domain.Devices.HostDevices, vmi.Spec.Domain.Devices.GPUs))
+	log.Log.Infof("----- numaToDevices : %v", numaToDevices)
+
+	// Start from the HostDev, go up to the `pcie-root-port` then change the port address to PXB index
+	// map Hostdevs (type='pci' <driver name='vfio'). if nothing - return
+	PCItoRootIndex := make(map[string]string)
+	for node, devGroups := range numaToDevices {
+		// value is an arrays of devices to connect
+		rootsPerNuma := numaToRootComplexMap[node]
+		if len(devGroups) != len(rootsPerNuma) {
+			// not enought PXBs was created
+			// TODO log
+			continue
+		}
+		for i, group := range devGroups {
+			PCIinGroup := strings.Split(group, ",")
+			for _, address := range PCIinGroup {
+				PCItoRootIndex[address] = rootsPerNuma[i]
+			}
+		}
+	}
+
+	//return controllers
+	return attachDevicesToRoot(devices.HostDevices, controllers, PCItoRootIndex)
+}
+
+func attachDevicesToRoot(devices []api.HostDevice, controllers []api.Controller, PCItoRootIndex map[string]string) []api.Controller {
+
+	// map controller to it's index
+	controllerToIndex := make(map[string]api.Controller)
+	for _, controller := range controllers {
+		controllerToIndex[controller.Index] = controller
+	}
+	// get the port controller from the map and change it's address to pxb index
+	for _, device := range devices {
+		sourceAddress := device.Source.Address
+		sourceAddrStr := fmt.Sprintf("%s:%s:%s.%s", sourceAddress.Domain[2:], sourceAddress.Bus[2:], sourceAddress.Slot[2:], sourceAddress.Function[2:])
+		if rootIndex, exists := PCItoRootIndex[sourceAddrStr]; exists {
+			// good case. we need to connect this hostdev
+			log.Log.Infof("--------- going to attach device %s to root index: %s", sourceAddrStr, rootIndex)
+			bus := device.Address.Bus[2:]
+			attachPortToRootComplex(rootIndex, bus, controllerToIndex)
+		}
+	}
+
+	return controllers
+}
+
+func attachPortToRootComplex(rootIndex string, bus string, controllerToIndex map[string]api.Controller) {
+	parentIndex := getParentIndex(bus)
+	if parentIndex == "" {
+		return
+	}
+	log.Log.Infof("--------- attachPortToRoorComplex parentIndex: %s; controllerToIndex: %v", parentIndex, controllerToIndex)
+	devContr, exists := controllerToIndex[parentIndex]
+	if !exists {
+		log.Log.Infof("--------- controller for the bus is not found")
+		return
+	}
+	log.Log.Infof("--------- controller for the bus is: (%v)", devContr)
+	model := devContr.Model
+	if model != "pcie-root-port" {
+		log.Log.Infof("--------- controller for the bus is not pcie-root-port but: %s", model)
+		if model == "pcie-root" {
+			log.Log.Infof("--------- controller is pcie-root. Done.")
+			return
+		}
+		//parentBus := devContr.Address.Bus[2:] // TODO: need to convert to decimal
+		parentIndex = getParentIndex(devContr.Address.Bus[2:])
+		if parentIndex == "" {
+			return
+		}
+		attachPortToRootComplex(rootIndex, parentIndex, controllerToIndex)
+	} else { // change the port bus to attach to PXB
+		// convert rootIndex to Hexadecimal
+		output, err := strconv.ParseInt(rootIndex, 10, 64)
+		if err != nil {
+			//TODO
+			log.Log.Infof("--------- failed to parse the rootIndex: %v", err)
+			return
+		}
+		log.Log.Infof("--------- rootIndex in Hex: %s", strconv.FormatInt(output, 16))
+
+		devContr.Address.Bus = strings.Replace(devContr.Address.Bus, devContr.Address.Bus[2:], strconv.FormatInt(output, 16), 1)
+		log.Log.Infof("--------- attached controller: %s to new address bus: %s", devContr.Index, devContr.Address.Bus)
+	}
+
+}
+
+func getParentIndex(bus string) string {
+	log.Log.Infof("--------- checking bus: %s", bus)
+	output, err := strconv.ParseUint(bus, 16, 64)
+	if err != nil {
+		//TODO
+		log.Log.Infof("--------- failed to ParseUint. output: (%v)", output)
+		return ""
+	}
+	log.Log.Infof("--------- output: (%v)", output)
+	return strconv.FormatUint(uint64(output), 10)
+}
+
+func listResources(resources []string) map[uint][]string {
+
+	rootToNuma := make(map[string]uint)
+	rootToDevices := make(map[string][]string)
+
+	for _, resource := range resources {
+		suffix := "_ROOT_COMPLEX" // TODO make it const
+		rootEnvVarName := util.ResourceNameToEnvVar(v1.PCIResourcePrefix, resource) + suffix
+		rootComplexString, isSet := os.LookupEnv(rootEnvVarName)
+		if !isSet {
+			log.Log.Warningf("%s not set for resource %s", rootEnvVarName, resource)
+			continue
+		}
+
+		rootComplexString = strings.TrimSuffix(rootComplexString, ",")
+		log.Log.Infof("----- rootComplexString : %s", rootComplexString)
+		rootComplexes := strings.Split(rootComplexString, ",")
+		for _, complex := range rootComplexes {
+			complexData := strings.Split(complex, "|")
+			if len(complexData) != 3 {
+				continue
+			}
+			numaNode, err := strconv.ParseUint(complexData[1], 10, 32)
+			if err != nil {
+				// invalid numa node
+				continue
+			}
+			rootBus := complexData[0]
+			if !strings.HasPrefix(rootBus, "pci") || rootBus == "pci0000:00" {
+				continue
+			}
+			rootToNuma[rootBus] = uint(numaNode)
+			rootToDevices[rootBus] = append(rootToDevices[rootBus], complexData[2])
+		}
+	}
+
+	log.Log.Infof("----- rootToNuma : %v", rootToNuma)
+	log.Log.Infof("----- rootToDevices : %v", rootToDevices)
+
+	numaToDevices := make(map[uint][]string) // the key is numaNode, the value is groups of PCI addreses for single root complex
+	for rootBus, numaNode := range rootToNuma {
+		numaToDevices[numaNode] = append(numaToDevices[numaNode], strings.Join(rootToDevices[rootBus], ","))
+	}
+
+	return numaToDevices
+}
+
+func extract(hostDevices []v1.HostDevice, gpus []v1.GPU) []string {
+	var resourceSet = make(map[string]struct{})
+	for _, hostDevice := range hostDevices {
+		resourceSet[hostDevice.DeviceName] = struct{}{}
+	}
+	for _, gpu := range gpus {
+		resourceSet[gpu.DeviceName] = struct{}{}
+	}
+	var resources []string
+	for resource := range resourceSet {
+		resources = append(resources, resource)
+	}
+	return resources
 }
 
 func appendPlaceholderInterfacesToTheDomain(vmi *v1.VirtualMachineInstance, domainSpec *api.DomainSpec) *api.DomainSpec {
